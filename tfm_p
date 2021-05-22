@@ -1,0 +1,1389 @@
+#!/usr/bin/env bash
+#
+# tfm - termial file manager
+#   based on fff
+
+# distance of item on screen from top of screen ???
+SCROLL=0
+# int [0 - # of files in cur dir] INDEX of a file under a cursor in the LIST
+INDEX=0
+
+TFM_LIST_START=4
+SUDO_COMMAND='sudo '
+
+TFM_CACHEDIR=${XDG_CACHE_HOME:=${HOME}/.cache}/tfm
+TFM_TRASHBIN=${XDG_DATA_HOME:=${HOME}/.local/share}/tfm/trash
+
+TFM_OPEN_MODE="xdg-open"
+
+EDITOR="subl"
+
+_cl='\e[m'
+_fcl='\e[38;5;'
+_bcl='\e[48;5;'
+
+_black='0m'
+_red='052m'
+_green='002m'
+_yellow='011m'
+_blue='037m'
+_magenta='090m'
+_cyen='121m'
+_white='015m'
+_gray='238m'
+
+
+
+
+
+
+size_terminal() {
+  read -r LINES COLUMNS < <(stty size)
+  ((TFM_MAX_SCROLL=LINES-TFM_LIST_START))
+}
+
+setup_terminal() {
+
+  printf '\e[?1049h\e[?7l\e[?25l\e[2J\e[%sH\e[1;%sr' "$TFM_LIST_START" "$LINES"
+}
+
+reset_terminal() {
+  printf '\e[?7h\e[?25h\e[2J\e[;r\e[?1049l'
+  printf '\e]2;%s - Alacritty\e'\\ "$PWD"
+  stty echo
+}
+
+clear_screen(){ 
+
+  printf '\e[2J\e[H'
+}
+
+status_bot() { 
+  # more like a status of the application:
+  # user/admin/ dot files status app mode status  (hints on hotkeys?)
+  local pos=2
+
+  [[ -z $1 ]] || {
+    printf '\e[%dH%b\e[K\n' $pos "$1" 
+    return 0
+  }
+
+  [[ -z $TFM_SUDO ]] && local stat_bg_col="$_cl" || local stat_bg_col="$_bcl$_red"
+  local usr="$stat_bg_col $(${TFM_SUDO}whoami) $_cl" 
+  (( TFM_DOTFILES )) && local dot="$_fcl$_gray👁" || local dot="$_fcl$_cyen👁"
+  [[ -r $PWD ]] && local pwdr="$_cl  " || local pwdr="$_fcl$_red-r$_cl"
+
+  local marked="$_cl( ${#TFM_MARKED_LIST[@]} ✓"
+  [[ "$PWD" == "$TFM_MARKED_DIR" ]] && marked+=' . )' || marked+=" in ${TFM_MARKED_DIR##*/} )" 
+  
+  local line=( "$usr" "$dot" "$pwdr" "$marked")
+
+
+  printf '\e[%dH%b\e[m\e[K\n' $pos "${line[*]}"
+}
+
+status_top() { 
+  # INDEX / # of files  pwd ; messages ; prompts
+  # changes on moving around and action
+
+  local pos=1
+  [[ $1 ]] && printf '\e[%dH%b\e[K\n' $pos "$1" || printf '\e[%dH%s\e[K\n' $pos "[$((INDEX+1)) $((TFM_MAX_INDEX+1))] $PWD"
+}
+
+padding() {
+  for (( i = 3; i < TFM_LIST_START; i++ )); do
+    printf '\e[%sH\e[K\n' "$i"
+  done
+}
+
+read_dir() {
+  # Read a directory to an array and sort it directories first.
+  # Makes TFM_LIST array variable
+  local dirs
+  local files
+  local item_index=0
+  local interest_index=0
+  local list_item
+  # Set window name.
+  if [[ -z $1 ]]; then
+    printf '\e]2;%s - tfm\e'\\ "$PWD"
+    [[ $PWD == / ]] && PWD=
+    local do_search=0
+  else
+    local do_search=1
+  fi
+  
+
+  if (( TFM_NEW_DIR )); then
+    INDEX=0
+  elif (( INDEX > TFM_MAX_INDEX )); then
+    INDEX=0
+  fi
+
+  TFM_NEW_DIR=0
+
+  if (( do_search )); then
+    local lss=( "${TFM_SEARCHLIST[@]}" )
+  else
+    local lss=( "$PWD"/* )
+  fi
+
+
+  for list_item in "${lss[@]}"; do
+    
+    if (( do_search )); then
+      if [[ ! "${list_item##*/}" =~ "$1" ]]; then
+        continue
+      fi
+    fi
+    
+
+    if [[ -d "$list_item" ]]; then
+        dirs+=("$list_item")
+        if [[ "$list_item" == "$TFM_SUBDIR" ]]; then
+          INDEX=$item_index
+          TFM_SUBDIR=''
+        fi
+        ((item_index++))
+    else
+        files+=("$list_item")
+    fi
+    
+
+
+    if [[ ! -z $TFM_INTEREST ]] && [[ "${list_item##*/}" == "${TFM_INTEREST##*/}" ]]; then
+      INDEX=$interest_index
+      unset TFM_INTEREST
+    fi
+    (( interest_index++  ))
+  done
+  unset TFM_INTEREST
+
+  TFM_LIST=("${dirs[@]}" "${files[@]}")
+
+  TFM_MAX_INDEX=${#TFM_LIST[@]}
+  if (( TFM_MAX_INDEX > 0 )); then
+    ((TFM_MAX_INDEX--))
+    TFM_EMPTY_PWD=0
+  else
+    if (( do_search )); then
+      read_dir
+    else
+      TFM_EMPTY_PWD=1
+      print_line 0 0
+    fi
+  fi
+  if (( INDEX > TFM_MAX_INDEX )); then
+    INDEX=$TFM_MAX_INDEX
+  fi
+}
+
+draw_screen() {
+  if [[ -z $1 ]]; then
+    clear_screen
+    status_top
+    status_bot
+  else
+    local do_search=1
+    printf '\e[4H\e[J'
+  fi
+  
+
+  local start_index=0
+  # TFM_MAX_SCROLL ok global as its figured per current screen elsewhere
+
+  # if INDEX is off screen
+  if ((INDEX > TFM_MAX_SCROLL));  then
+    if ((INDEX+TFM_MAX_SCROLL < TFM_MAX_INDEX)); then
+      start_index=$INDEX
+    else
+      start_index=$((TFM_MAX_INDEX-TFM_MAX_SCROLL))
+    fi
+  fi
+
+
+  local scr=0
+  while ((scr<TFM_MAX_INDEX+1)); do
+    # if list smaller than screen loop ends before reaching bot
+    print_line $((start_index+scr)) $scr
+    
+    if ((scr > TFM_MAX_SCROLL)) ; then
+      # list is bigger than screen
+      break
+    fi
+
+    if ((start_index+scr+1 > TFM_MAX_INDEX)); then
+      # we are out of items in the list
+      break
+    fi
+
+    ((scr++))
+  done
+
+  draw_scale
+
+  (( do_search )) && printf '\e[%d;%dH' "$((TFM_LIST_START-1))" "$TFM_INP_CURPOS"
+}
+
+mark() {
+  # Mark file for operation.
+  # If an item is marked in a second directory,
+  # clear the marked files.
+  case $1 in
+    -toggle )
+      
+      # Don't allow the user to mark the empty directory list item.
+      if (( TFM_EMPTY_PWD )) && [[ -z $2 ]]; then
+        return 1
+      fi
+      
+      [[ "$PWD" != "$TFM_MARKED_DIR" ]] &&
+          TFM_MARKED_LIST=()
+
+      if [[ "${TFM_MARKED_LIST[$2]}" == "${TFM_LIST[$2]}" ]]; then
+        unset 'TFM_MARKED_LIST[$2]'
+      else
+        TFM_MARKED_LIST[$2]="${TFM_LIST[$2]}"
+        TFM_MARKED_DIR="$PWD"
+      fi
+      print_line "$2" "$SCROLL"
+      status_bot
+
+    ;;
+
+
+    -toggleall )
+      local lk
+      for lk in "${!TFM_LIST[@]}"; do
+        mark -toggle "$lk"
+      done
+      draw_screen
+    ;;
+
+    -reindex )
+
+      local list_index=0
+      local lk
+      local count_iterations=0
+      local new_marked_list=()
+
+
+      for lk in "${!TFM_MARKED_LIST[@]}"; do
+        if (( list_index > TFM_MAX_INDEX )); then
+          list_index=0
+        fi
+        
+        while (( list_index <= TFM_MAX_INDEX )); do
+          if [[ "${TFM_MARKED_LIST[$lk]}" == "${TFM_LIST[$list_index]}" ]]; then
+            new_marked_list[$list_index]="${TFM_LIST[$list_index]}"
+            break
+          else
+            (( list_index++ ))
+          fi
+
+        done
+
+      done
+
+      TFM_MARKED_LIST=()
+      for x in "${!new_marked_list[@]}"; do
+        TFM_MARKED_LIST[$x]="${new_marked_list[$x]}"
+      done
+    ;;
+
+    -reset )
+      TFM_MARKED_LIST=()
+      TFM_MARKED_DIR=
+    ;;
+  esac
+}
+
+print_line(){
+  # f( <INDEX in array>, <SCROLL pos>)
+
+
+  # idea: 
+  # make array of characters like: ( selection marked filetype  )  so each char represents 
+  # a distinct layer. conditions build aray var for the file. Then we go through array 
+  # and build a string with propper format based on presets variables?
+
+  # shorter; easier to config; use binary for setting 
+
+
+
+  local idx_iter=${1:-0}
+  local scr_pos=${2:-0}
+
+  local posit=$((scr_pos+TFM_LIST_START))
+  local name_length=21
+
+  if (( TFM_EMPTY_PWD )); then
+    printf '\e[%sH\e[K\e[38;5;241m%s\e[m' "$posit" " ¯\_(ツ)_∕¯"
+    return
+  fi
+
+  if (( scr_pos > TFM_MAX_SCROLL )); then
+    return
+  fi
+  
+  local symbols=(' ' ' ')
+  local symb_bg='\e[m'
+  local format=('' '')
+  local prefix=' '
+  local suffix=' '
+  local right_pad='                                   '
+
+
+
+  local file_name=${TFM_LIST[$idx_iter]##*/}
+  # local file_ext=${file_name##*.}
+  # local marked="\e[38;5;0m"
+
+  # If the dir item doesn't exist, end here.
+  if [[ -z "${TFM_LIST[$idx_iter]}" ]]; then
+      return
+
+  # Directory.
+  elif [[ -d "${TFM_LIST[$idx_iter]}" ]]; then
+    # fg_format='\e[1m\e[38;5;66m'
+    format[1]='\e[1m\e[38;5;66m'
+    file_name="$file_name/"
+
+    # line+=( ' dir ' )
+
+  # Executable file.
+  elif [[ -x "${TFM_LIST[$idx_iter]}" ]]; then
+      suffix='\e[38;5;002m٭'
+      format[1]='\e[38;5;002m'
+
+    #   fg_format='\e[38;5;002m'
+    #   marked="\e[38;5;002m  "
+    # line+=( ' exe ' )
+
+
+  # Link.
+  elif [[ -h "${TFM_LIST[$idx_iter]}" ]]; then
+      if [[ ! -e "${TFM_LIST[$idx_iter]}" ]]; then
+        suffix='\e[38;5;219m↝'
+
+      else
+        suffix='\e[38;5;150m↦'
+
+      fi
+
+
+
+
+  # Readable.
+  elif [[ ! -r "${TFM_LIST[$idx_iter]}" ]]; then
+        format[1]='\e[38;5;239m'
+
+  # Writable.
+  elif [[ ! -w "${TFM_LIST[$idx_iter]}" ]]; then
+        format[1]='\e[38;5;244m'
+  fi
+
+
+
+  # If the list item is marked for operation.
+  [[ ${TFM_MARKED_LIST[$idx_iter]} == "${TFM_LIST[$idx_iter]:-null}" ]] && {
+    symbols[1]='\e[38;5;034m✓'
+    format[0]='\e[48;5;101m'
+    # right_pad='\e[48;5;101m'"$right_pad"
+    suffix='\e[48;5;101m'"$suffix"
+    sel_bg='\e[48;5;101m'
+
+  }
+
+  # check if we printing selected item; NOT scr_pos
+  if (( INDEX == idx_iter )); then
+      SCROLL=$scr_pos
+      # line+=( ' sel ' )
+      # local slct="\e[48;5;235m٭ "
+      symbols[0]='\e[38;5;108m➤'
+      format[0]='\e[48;5;235m'
+      suffix='\e[48;5;235m'"$suffix"
+      symb_bg=''
+      sel_bg='\e[48;5;235m'
+  fi  
+
+
+  
+  local symb_ass="$(printf '%s' "${symbols[@]}")\e[m"
+  local text_format="$(printf '%s' "${format[@]}")"
+
+  if (( ${#file_name} > name_length )); then
+    local short=('\e[38;5;108m' ' …')
+    file_name="${file_name:0:$((name_length-${#short[1]}))}"
+  fi
+  # local line="$prefix$file_name$suffix$right_pad"
+  local line="$file_name${short[0]}${short[1]}$right_pad"
+  line="${line:0:$((name_length+${#short[0]}+1))}"
+  line="$sel_bg$symb_bg$symb_ass$text_format$prefix$line$suffix"
+
+  printf '\e[%sH\e[K  %b\e[m' "$posit" "$line"
+}
+
+draw_scale() {
+  (( TFM_EMPTY_PWD )) && return 0
+  local numbs=(' ' '1' '2' '3' '4' '5' '6' '7' '8' '9' ' ')
+  local i
+  for (( i = 0; i < 11; i++ )); do
+    printf '\e[%sH\e[38;5;236m%s\e[m'  $((TFM_LIST_START + i)) "${numbs[i]}"
+  done
+}
+
+move_down() {
+  if (( INDEX < TFM_MAX_INDEX )); then
+    ((INDEX++))
+  else
+    return
+  fi
+
+  if (( SCROLL < TFM_MAX_SCROLL )); then
+    ((SCROLL++))
+  else
+    printf '\e[S'
+    status_bot
+    padding
+  fi
+
+  status_top
+  print_line $((INDEX-1)) $((SCROLL-1))
+  print_line $INDEX $SCROLL
+
+  draw_scale
+}
+
+move_up() {
+  if (( INDEX > 0 )); then
+    ((INDEX--))
+  else
+    return
+  fi
+
+  if (( SCROLL > 0 )); then
+    ((SCROLL--))
+  else
+    printf '\e[T'
+    status_bot
+    padding
+  fi
+
+  status_top
+  print_line $INDEX $SCROLL
+  print_line $((INDEX+1)) $((SCROLL+1))
+  
+  draw_scale
+}
+
+list_prep() {
+  # makes a list to work with.
+  # if 'local' arg given, just uses scroll pos.
+  # 
+  TFM_SOURCE_FILES=()
+  TFM_SOURCE_DIR=$TFM_MARKED_DIR
+  local pwd_only=1
+
+  if [[ "$1" == '-local' ]]; then
+    if [[ ! $TFM_SOURCE_DIR == $PWD ]] || [[ -z $TFM_SOURCE_DIR ]]; then
+      pwd_only=0
+    fi
+  fi
+
+  if [[ ${TFM_MARKED_LIST[*]} ]] && (( pwd_only )); then
+    TFM_SOURCE_FILES=( "${TFM_MARKED_LIST[@]}" )
+  else
+    TFM_SOURCE_FILES=( "${TFM_LIST[INDEX]}" )
+    TFM_SOURCE_DIR=$PWD
+  fi
+}
+
+sudo_switch() {
+  if [[ $TFM_SUDO == $SUDO_COMMAND ]]; then
+    TFM_SUDO=''
+    read_dir
+    draw_screen
+    status_top "run as user"
+    status_bot
+  else
+    TFM_SUDO=$SUDO_COMMAND
+    read_dir
+    draw_screen
+    status_top "run as sudo"
+    status_bot
+  fi
+}
+
+open() {
+  if [[ $1 == -n ]]; then
+    TFM_NEW_DIR=1
+    local a_dir="$2"
+  else
+    local a_dir="$1"
+  fi
+
+  if [[ -d "$a_dir/" ]]; then
+    if [[ -x "$a_dir/" ]]; then
+      cd "${a_dir:-/}" ||:
+      read_dir
+      draw_screen
+    else
+      status_top "x bit unset on dir"
+    fi
+  else
+    status_bot
+  fi
+}
+
+launch() {
+
+
+  local a_file
+  local messages=''
+
+  local clear_to_execute=1
+  local op_files=()
+
+  local counter=0
+  local prompt_if_many=0
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+
+    if [[ -d "$a_file" ]]; then
+      open "$a_file"
+      return 0
+    fi
+
+    if [[ -r "$a_file" ]]; then
+      op_files=("${op_files[@]}" "$(printf '%s %s' "${TFM_OPEN_MODE}" "$a_file")"  )
+      (( counter++ ))
+    else
+      if [[ ! -z $TFM_SUDO ]]; then
+        op_files=("${op_files[@]}" "$(printf '%s %s' "$EDITOR" "$a_file")"  )
+        (( counter++ ))
+      else
+        messages="Can't read $a_file"
+        clear_to_execute=0
+        break
+      fi
+    fi
+
+    if [[ $counter -gt 8 ]]; then
+      messages="Too many files to open"
+      clear_to_execute=0
+      break
+    elif [[ $counter -gt 3 ]]; then
+      prompt_if_many=1
+    fi
+  done
+
+  (( prompt_if_many && clear_to_execute )) && {
+    if input_prompt "bin_input_reply" "" "" "Launch $counter files?" "y"; then
+      messages='opened'
+    else
+      messages="Launch canceled"
+      clear_to_execute=0
+    fi
+  }
+
+  if (( clear_to_execute )); then
+    for iter in "${op_files[@]}"; do
+      ${iter}
+    done
+    mark -reset
+    draw_screen
+  else
+    status_top "$messages"
+  fi
+}
+
+copy_file() {
+  local file_command='cp -pR'
+
+  case $1 in
+    'link' )
+      local file_command='ln -s'
+    ;;
+
+    'move' )
+      local file_command='mv -i'
+    ;;
+  esac
+
+  local a_file
+  local TFM_IP_MESSAGE=''
+
+  local clear_to_execute=1
+
+  local can_wto_pwd=1
+  [[ -w $PWD ]] && can_wto_pwd=$(( can_wto_pwd&&1 )) || can_wto_pwd=0
+  [[ -x $PWD ]] && can_wto_pwd=$(( can_wto_pwd&&1 )) || can_wto_pwd=0
+  [[ ! -z $TFM_SUDO ]] && can_wto_pwd=1
+
+  (( can_wto_pwd )) || {
+    TFM_IP_MESSAGE="No write access to $PWD"
+    clear_to_execute=0
+  }
+
+  local file_count=0
+  local op_file_from=()
+  local op_file_to=()
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+    local can_read=0
+    local broke_link=0
+
+    if [[ -r $a_file ]]; then
+        can_read=1
+    fi
+
+    if (( can_read )) || [[ ! -z $TFM_SUDO ]]; then
+      op_file_from[$file_count]="$a_file"
+      op_file_to[$file_count]="$(get_unique_name "$PWD" "${a_file##*/}")"
+      (( file_count++ ))
+
+    else
+      TFM_IP_MESSAGE="Can't read $a_file"
+      clear_to_execute=0
+      break
+    fi
+  done
+
+
+  if (( clear_to_execute )); then
+    # for iter in "${op_files[@]}"; do
+      for (( i = 0; i < file_count; i++ )); do
+      ${TFM_SUDO}${file_command} "${op_file_from[i]}" "${op_file_to[i]}"
+      TFM_INTEREST="${op_file_to[i]}"
+    done
+    TFM_IP_MESSAGE="done"
+    mark -reset
+    read_dir
+    draw_screen
+  fi
+  
+  status_top "$TFM_IP_MESSAGE"
+}
+
+search() {
+  TFM_SEARCHLIST=("${TFM_LIST[@]}")
+  input_prompt "search_ok" "search_canc" "search_char" "goto/"
+}
+
+search_ok () {
+  unset TFM_SEARCHLIST
+  return 0
+}
+
+search_canc () {
+  unset TFM_SEARCHLIST
+  read_dir
+  draw_screen
+  return 1
+}
+
+search_char () {
+
+  read_dir "$1"
+  draw_screen "search"
+}
+
+delete_file() {
+
+  local a_file
+  local messages=''
+  local clear_to_execute=1
+
+  TFM_IP_CANCELED=0
+
+  local op_files=()
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+    local can_write=0
+    local broke_link=0
+    
+
+    if [[ -w "$a_file" ]]; then
+        can_write=1
+    else
+      if [[ -h "$a_file" ]]; then
+        can_write=1
+        broke_link=1
+      fi
+    fi
+
+
+    if [[ ! -z $TFM_SUDO ]] || (( can_write )); then
+      if (( broke_link )); then
+        op_files=("${op_files[@]}" "$(printf 'trash_method_r %s' "$a_file")")
+      else
+        op_files=("${op_files[@]}" "$(printf 'trash_method %s' "$a_file")")
+      fi
+    else
+      TFM_IP_MESSAGE='No write access'
+      clear_to_execute=0
+      break
+    fi
+  done
+
+  (( ${#op_files[@]} < 2 )) || local ess='s'
+
+  if (( clear_to_execute )); then
+    if input_prompt  "bin_input_reply" "cancel_reply" "" "delete ${#op_files[@]} file$ess? [Y/n]" "y"; then
+      TFM_IP_MESSAGE="deleting"
+    else
+      clear_to_execute=0
+    fi
+  fi
+
+  if (( TFM_IP_CANCELED )); then
+    status_top
+    status_bot
+    return 1
+  fi
+
+  if (( clear_to_execute )); then
+    for iter in "${op_files[@]}"; do
+      ${iter}
+    done
+    mark -reset
+    read_dir
+    draw_screen
+  else
+    status_top "$TFM_IP_MESSAGE"
+  fi
+}
+
+trash_method_r() {
+  TFM_IP_MESSAGE="removed"
+  rm "$1"
+}
+
+trash_method() {
+  local fle="$(printf '%s ' "$@")"
+  fle=("${fle:0:-1}")
+  local cmdcp="$(printf "%scp -alf '%s' %s" "${TFM_SUDO}" "$fle" "$TFM_TRASHBIN")"
+  local cmdrm="$(printf "%srm -r '%s'" "${TFM_SUDO}" "$fle")"
+  local cmdmv="$(printf "%smv -f '%s' %s" "${TFM_SUDO}" "$fle" "$TFM_TRASHBIN")"
+
+
+  if ${TFM_SUDO}cp -alf "${fle[@]}" "$TFM_TRASHBIN"; then
+    ${TFM_SUDO}rm -r "${fle[@]}"
+  else
+    ${TFM_SUDO}mv -f "${fle[@]}" "$TFM_TRASHBIN"
+  fi
+  TFM_IP_MESSAGE="removed to trash"
+
+
+}
+
+show_info() {
+  local a_file="${TFM_LIST[INDEX]}"
+  status_bot "$(stat -c '%A %U %s %N' "${a_file##*/}" )"
+
+  # show size of file on disk
+  # $(du -h "$a_file")
+}
+
+make_new() {
+  case $1 in
+    "file" )
+      local prompt_mes="New file name"
+      local create_command='make_new_file'
+    ;;
+    "dir" )
+      local prompt_mes="New directory name"
+      local create_command='make_new_dir'
+    ;;
+  esac
+  if [[ ! -z $TFM_SUDO ]] || [[ -w $PWD ]]; then
+    if input_prompt  "$create_command" "cancel_reply" "" "$prompt_mes"; then
+      read_dir
+      draw_screen
+    fi
+  else
+    TFM_IP_MESSAGE="no write access"
+  fi
+  status_top "$TFM_IP_MESSAGE"
+}
+
+make_new_file() {
+  if [[ -e "$1" ]]; then
+    TFM_IP_MESSAGE="file $1 already exists"
+    return 1
+  else
+    $TFM_SUDO touch "$1"
+    TFM_INTEREST="$1"
+    TFM_IP_MESSAGE="created $1"
+    return 0
+  fi
+}
+
+make_new_dir() {
+  if [[ -e "$1" ]]; then
+    TFM_IP_MESSAGE="dir $1/ already exists"
+    return 1
+  else
+    $TFM_SUDO mkdir "$1"
+    TFM_INTEREST="$1"
+    TFM_IP_MESSAGE="created $1/"
+    return 0
+  fi
+}
+
+rename_file() {
+  local a_file="${TFM_LIST[INDEX]}"
+  local clear_to_execute=1
+  local can_wto_pwd=1
+  TFM_IP_MESSAGE=''
+
+  [[ -w "$PWD" ]] || can_wto_pwd=0
+  [[ -x "$PWD" ]] && can_wto_pwd=$(( can_wto_pwd&&1 )) || can_wto_pwd=0
+  [[ ! -z $TFM_SUDO ]] && can_wto_pwd=1
+
+  (( can_wto_pwd )) || {
+    TFM_IP_MESSAGE="No write access to $PWD"
+    clear_to_execute=0
+  }
+
+  [[ -w "$a_file" ]] || [[ ! -z $TFM_SUDO ]] || {
+    TFM_IP_MESSAGE="No write access to $a_file"
+    clear_to_execute=0
+  }
+
+  if (( clear_to_execute )); then
+    if input_prompt  "rename_prompt" "cancel_reply" "" "Rename file:" "${a_file##*/}"; then
+      printf ''
+    fi
+  fi
+
+  if (( clear_to_execute )); then
+    ${TFM_SUDO}mv "$a_file" "$TFM_RENAME"
+    TFM_INTEREST="$TFM_RENAME"
+    read_dir 
+    draw_screen
+    TFM_IP_MESSAGE="renamed ${a_file##*/}"
+  fi
+
+  status_top "$TFM_IP_MESSAGE"
+}
+
+rename_prompt() {
+  if [[ -e "$PWD/$1" ]]; then
+    TFM_IP_MESSAGE="file $1 already exists"
+    return 1
+  else
+    TFM_RENAME="$PWD/$1"
+    return 0
+  fi
+}
+
+chmod_files() {
+
+  local a_file
+  local op_file
+  TFM_IP_MESSAGE=''
+  local clear_to_execute=1
+  local op_files=()
+  
+
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+    local can_write=0
+    local broke_link=0
+    if [[ -w "$a_file" ]]; then
+        can_write=1
+    else
+      if [[ -h "$a_file" ]]; then
+        can_write=1
+        broke_link=1
+      fi
+    fi
+
+
+    if [[ ! -z $TFM_SUDO ]] || (( can_write )); then
+      op_files=("${op_files[@]}" "$a_file")
+    else
+      TFM_IP_MESSAGE='No write access'
+      clear_to_execute=0
+      break
+    fi
+  done
+
+  if (( clear_to_execute )); then
+    if ! input_prompt  "chmod_prompt" "cancel_reply" "" "new file mode bits:"; then
+      clear_to_execute=0
+      status_top "$TFM_IP_MESSAGE"
+      return 1
+    fi
+  fi
+
+  if (( clear_to_execute )); then
+    for op_file in "${op_files[@]}"; do
+      TFM_IP_MESSAGE="$(${TFM_SUDO}chmod "$TFM_CHMOD" "$op_file" 2>&1 >/dev/null)"
+      TFM_IP_MESSAGE="${TFM_IP_MESSAGE:7:12}"
+    done
+    TFM_INTEREST=$op_file
+    mark -reset
+    read_dir
+    draw_screen
+  fi
+
+  status_top "$TFM_IP_MESSAGE"
+}
+
+chmod_prompt() {
+  TFM_CHMOD="$1"
+  TFM_IP_MESSAGE='Mode bits set'
+  return 0
+}
+
+chown_file() {
+  TFM_IP_MESSAGE=''
+  local clear_to_execute=1
+  local op_files=()
+  local op_file
+  if [[ ! -z $TFM_SUDO ]]; then
+    if input_prompt "chown_prompt" "cancel_reply" "" "new file owner:"; then
+      TFM_IP_MESSAGE="changed file owner to $TFM_NEWOWNER"
+    else
+      clear_to_execute=0
+    fi
+  else
+    TFM_IP_MESSAGE="Need to be root"
+    clear_to_execute=0
+  fi
+
+
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+      op_files=( "${op_files[@]}" "$a_file" )
+  done
+
+
+  if (( clear_to_execute )); then
+    for op_file in "${op_files[@]}"; do
+      TFM_IP_MESSAGE="$(${TFM_SUDO}chown "$TFM_NEWOWNER" "$op_file" 2>&1 >/dev/null)"
+      # TFM_IP_MESSAGE="${TFM_IP_MESSAGE:7:12}"
+    done
+    TFM_INTEREST="$op_file"
+    mark -reset
+    read_dir
+    draw_screen
+  fi
+
+  status_top "$TFM_IP_MESSAGE"
+}
+
+chown_prompt() {
+  TFM_NEWOWNER="$1"
+  TFM_IP_MESSAGE="changed owner"
+  return 0
+}
+
+copy_path() {
+  local a_file
+  local op_files
+  for a_file in "${TFM_SOURCE_FILES[@]}"; do
+    op_files+="$(printf '"%b"' "$a_file") "
+  done
+  op_files="${op_files::-1}"
+  printf '%b' "${op_files}" | xclip -selection clipboard
+  status_top "Copied path"
+}
+
+get_unique_name() {
+
+
+  local path="$1"
+  local name="$2"
+  local ffile="$1/$2"
+
+
+  if [[ ${name:0:1} == '.' ]]; then
+    local hiddn='.'
+    name=${name#.}
+  fi
+
+  if [[ -d $ffile ]]; then
+    local nn=1
+    name+='_'
+    while [[ -d "$path/$hiddn$name$nn" ]]; do
+      ((nn++))
+    done
+    printf '%s' "$path/$hiddn$name$nn"
+    return 0
+  fi
+
+  if [[ -f $ffile ]]; then
+    if [[ $name =~ '.' ]]; then
+      local ext=".${name##*.}"
+      name="${name%.*}_"
+    else
+      local ext=''
+      name="$name"'_'
+    fi
+    local nn=1
+    while [[ -f "$path/$hiddn$name$nn$ext" ]]; do
+      ((nn++))
+    done
+    printf '%s' "$path/$hiddn$name$nn$ext"
+    return 0
+  else
+    printf '%s' "$ffile"
+    return 0
+  fi
+}
+
+bin_input_reply() {
+  local inp_text=$1
+  local inp_text=${inp_text,,}
+  [[ -z $inp_text ]] && return 1
+  if [[ "$inp_text" =~ ^yea{0,1}s{0,2}$|^[y]{1,4}$|^mhm$ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+cancel_reply() {
+  TFM_IP_MESSAGE="canceled"
+  TFM_IP_CANCELED=1
+  status_bot
+  return 1
+}
+
+input_prompt() {
+  # f( callbackf,  esccallback, stepcallback, "stringPrompt" )
+
+  # of line for user to enter text
+  local pos_line=3
+
+  local TFM_INPUT_COLOR='\e[38;5;122m'
+  
+  [[ -z $4 ]] && status_top "input" || status_top "$4"
+  printf '\e[%dH\e[K\e[?25h' $pos_line
+  local inp_text="$5"
+  local input_call="$1"
+  local cancel_call="$2"
+  local step_call="$3"
+  local cur_pos=${#inp_text}
+  TFM_INP_CURPOS=${#inp_text}
+  TFM_INP_CURPOS=$((TFM_INP_CURPOS+1))
+  printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+  printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+
+  while [[ 1 ]]; do
+    read_one_key
+    if [[ $KEY_PRESSED != 0 ]]; then
+
+      case $KEY_CHAR in
+
+        '<ent' )
+          printf '\e[%dH\e[K\e[?25l' $pos_line
+          if [[ -z $input_call ]]; then
+            return 0
+          else
+            if $input_call "$inp_text"; then
+              return 0
+            else
+              return 1
+            fi
+          fi
+        ;;
+
+        '<esc' )
+          printf '\e[%dH\e[K\e[?25l' $pos_line
+          if [[ -z $cancel_call ]]; then
+            return 1
+          else
+            if $cancel_call; then
+              return 0
+            else
+              return 1
+            fi
+          fi
+        ;;
+
+        '<bs'  )
+          [[ $cur_pos > 0 ]] && {
+            inp_text="${inp_text:0:$((cur_pos-1))}""${inp_text:$cur_pos}"
+            ((cur_pos--))
+            printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+            printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+            TFM_INP_CURPOS=$((cur_pos+1))
+            if [[ ! -z $step_call ]]; then
+              $step_call "$inp_text"
+            fi
+          }
+
+        ;;
+        '<del' ) 
+          inp_text="${inp_text:0:$cur_pos}""${inp_text:$((cur_pos+1))}"
+          printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+          printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+          TFM_INP_CURPOS=$((cur_pos+1))
+          if [[ ! -z $step_call ]]; then
+            $step_call "$inp_text"
+          fi
+        ;;
+        '<left' )
+          [[ $cur_pos > 0 ]] && ((cur_pos--))
+          printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+          printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+
+        ;;
+        '<home' ) 
+          printf "\e[200D"
+          cur_pos=0
+        ;;
+        '<end' ) 
+          cur_pos=${#inp_text}
+          printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+        ;;
+        '<rite' )
+          [[  $cur_pos < ${#inp_text} ]] && {
+            ((cur_pos++))
+          }
+          printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+          printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+        ;;
+
+
+        # to avoid random nonprintable characters from entering
+        '<up'|'<down'|'<tab'|'<ins'|'<pgu'|'<pgd'|'<f'[0-9]) printf "" ;;
+
+
+        *)
+          inp_text="${inp_text:0:$cur_pos}""$KEY_CHAR""${inp_text:$cur_pos}"
+          ((cur_pos++))
+          printf "\e[%d;1H\e[2K%b%s\e[m" $pos_line "$TFM_INPUT_COLOR" "$inp_text"
+          printf '\e[%d;%dH' $pos_line $((cur_pos+1))
+          
+          TFM_INP_CURPOS=$((cur_pos+1))
+          if [[ ! -z $step_call ]]; then
+            $step_call "$inp_text"
+          fi
+        ;;
+      esac
+    fi
+  done
+}
+
+read_one_key() {
+  if read -t2 -srn 1; then
+    local s_key=''
+    local raw_key="$REPLY"
+    [[ $REPLY == $'\e' ]] && {
+      if read -t0.001 -rsn 1 ;then
+        raw_key+="$REPLY"
+        [[ $REPLY == '[' || 'O' ]] && {
+          while read -t0.001 -rsn 1 ; do
+            raw_key+="$REPLY"
+          done
+        }
+      else
+        raw_key=$'\e'
+      fi
+    }
+
+
+
+    KEY_PRESSED=1
+    case $raw_key in
+      $'\e')            s_key='<esc'  ;;
+      '')               s_key='<ent'  ;;
+      $'\e[A'|$'\eOA')  s_key='<up'   ;;
+      $'\e[B'|$'\eOB')  s_key='<down' ;;
+      $'\177'|$'\b')    s_key='<bs'   ;;
+      $'\t')            s_key='<tab'  ;;
+      $'\e[C')          s_key='<rite' ;;
+      $'\e[D')          s_key='<left' ;;
+      $'\e[2~')         s_key='<ins'  ;;
+      $'\e[3~')         s_key='<del'  ;;
+      $'\e[H')          s_key='<home' ;;
+      $'\e[F')          s_key='<end'  ;;
+      $'\e[5~')         s_key='<pgu'  ;;
+      $'\e[6~')         s_key='<pgd'  ;;
+      $'\eOP')          s_key='<f1'   ;;
+      $'\eOQ')          s_key='<f2'   ;;
+      $'\eOR')          s_key='<f3'   ;;
+      $'\eOS')          s_key='<f4'   ;;
+      $'\e[15~')        s_key='<f5'   ;;
+      $'\e[17~')        s_key='<f6'   ;;
+
+      
+      *)
+        s_key="$raw_key"
+        KEY_PRESSED=2
+      ;;
+
+    esac
+
+    KEY_CHAR="$s_key"
+    KEY_RAW="$raw_key"
+  else
+    unset KEY_CHAR
+    unset KEY_RAW
+    KEY_PRESSED=0
+  fi    
+}
+
+hotkeys() {
+
+  [[ ! -z $1 ]] && KEY_CHAR="$1"
+
+  case $KEY_CHAR in
+
+
+    'q'     )      
+      : "${FFF_CD_FILE:=}"
+
+      [[ -w "$TFM_CACHEDIR/.tfm_d" ]] &&
+          rm "$TFM_CACHEDIR/.tfm_d"
+
+      [[ ${TFM_CD_ON_EXIT:=1} == 1 ]] &&
+          printf '%s\n' "$PWD" > "$TFM_CACHEDIR/.tfm_d"
+
+      exit
+
+    ;;
+    
+    '<ent'  )      list_prep -local; launch        ;;
+    '<up'   )      move_up                          ;;
+    '<down' )      move_down                        ;;
+    'u'     )      sudo_switch                      ;;
+    's'     )      mark -toggle "$INDEX"            ;;
+    'S'     )      mark -toggleall                  ;;
+    'c'     )      list_prep; copy_file             ;;
+    'l'     )      list_prep; copy_file "link"      ;;
+    'm'     )      list_prep; copy_file "move"      ;;
+    'f'     )      make_new "file"                  ;;
+    'n'     )      make_new "dir"                   ;;
+    'r'     )      rename_file                      ;;
+    'd'     )      list_prep -local; delete_file   ;;
+    'W'     )      list_prep -local; chown_file    ;;
+    'w'     )      list_prep -local; chmod_files   ;;
+    'z'     )      list_prep -local; copy_path     ;;
+    '/'     )      search                           ;;
+    'i'     )      (( TFM_EMPTY_PWD )) || show_info ;;
+    '~'     )      open "$HOME" ;;
+
+    
+    # 'j'     )      into script; open in editor     ;;
+     
+
+    '.'     )    
+      local shopt_flags=("s" "u")
+      TFM_DOTFILES=$((!TFM_DOTFILES))
+      shopt "-${shopt_flags[TFM_DOTFILES]}" dotglob
+      read_dir
+      mark -reindex
+      draw_screen
+    ;;
+
+    '<f5'      )
+      read_dir
+      draw_screen
+    ;;
+
+    '<left' )
+      if [[ $PWD && $PWD != / ]]; then
+        find_previous=1
+        TFM_SUBDIR=$PWD
+        open "${PWD%/*}"
+      fi
+    ;;
+
+    '<rite' )
+      (( TFM_EMPTY_PWD )) || open -n "${TFM_LIST[$INDEX]}"
+    ;;
+
+    [1-9] )
+      local indx=$(($INDEX-$SCROLL+$KEY_CHAR))
+      if ((indx > TFM_MAX_INDEX)); then
+        indx=$TFM_MAX_INDEX
+        local missclick=1
+      fi
+      if [[ ! $missclick ]] && [[ -d ${TFM_LIST[indx]} ]]; then
+        open -n "${TFM_LIST[indx]}"
+      else
+        local start_index=$(($INDEX-$SCROLL))
+        local old_sel=($INDEX $SCROLL)
+        SCROLL=$indx
+        INDEX=$indx
+        print_line $INDEX $SCROLL
+        print_line ${old_sel[0]} ${old_sel[1]}
+        draw_scale
+      fi
+    ;;
+
+  esac
+}
+
+main() {
+  shopt -s nocaseglob nullglob
+
+  # Trap the exit signal (we need to reset the terminal to a useable state.)
+  trap 'reset_terminal' EXIT
+
+  # Trap the window resize signal (handle window resize events).
+  trap 'size_terminal; draw_screen' WINCH
+
+  mkdir -p "$TFM_CACHEDIR" "$TFM_TRASHBIN"
+  
+  size_terminal
+  setup_terminal
+  hotkeys .
+  read_dir
+  draw_screen
+
+
+  while true; do
+      read_one_key
+      [[ $KEY_PRESSED != 0 ]] && hotkeys
+      
+      [[ -t 1 ]] || exit 1
+  done
+}
+
+
+
+
+
+
+main "$@"
+
+# exit
+
+
+
+
+
+# list is of full name files
+# /home/user/file1
+# /home/user/file2
+# ...
+
+
+# displayed only name
+# # displayed only screen size (1 - 55ish)
+
+# list[x] == file
+
+# list[a] .. list[b] on screen
+
+# list[sel]  == selected item
+
+
+
+# # selection INDEX === list INDEX by number so there is no arithmetics to "screw with" ??
+
+
+
+# nav funcs:
+#   draw_screen
+#     - (from .. to) INDEX, INDEX
+#   updateline when move up/down
+#     - (line to update) INDEX
+
+
+
+
+
